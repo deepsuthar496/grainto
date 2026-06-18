@@ -14,6 +14,8 @@ import { exportAnimation } from "@/lib/animation-export";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
 import { ZoomBar } from "./NoiseGenerator";
+import ReactCrop, { type Crop, type PixelCrop } from "react-image-crop";
+import "react-image-crop/dist/ReactCrop.css";
 import {
   SettingsSection,
   SettingsRow,
@@ -37,6 +39,15 @@ import {
 } from "./effect-renderers";
 
 type EffectType = "ascii" | "glitch" | "halftone" | "dithering" | "matrix-rain" | "dots" | "contour" | "pixel-sort" | "blockify" | "threshold" | "edge-detection" | "crosshatch" | "wave-lines" | "noise-field" | "voronoi" | "vhs";
+
+interface AdjustmentsSettings {
+  brightness: number;
+  contrast: number;
+  hue: number;
+  saturation: number;
+}
+const DEFAULT_ADJUSTMENTS: AdjustmentsSettings = { brightness: 100, contrast: 100, hue: 0, saturation: 100 };
+
 type InputSource = "image" | "video" | "model";
 
 interface AsciiSettings {
@@ -107,7 +118,7 @@ const CHARSETS: Record<string, string> = {
   detailed: " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
 };
 
-const PREVIEW_SIZE = 512;
+const MAX_PREVIEW_SIZE = 512;
 
 export function EffectsGenerator() {
   const [effectType, setEffectType] = useState<EffectType>("ascii");
@@ -128,6 +139,37 @@ export function EffectsGenerator() {
   const [noiseField, setNoiseField] = useState<NoiseFieldSettings>({ ...DEFAULT_NOISE_FIELD });
   const [voronoi, setVoronoi] = useState<VoronoiSettings>({ ...DEFAULT_VORONOI });
   const [vhs, setVhs] = useState<VHSSettings>({ ...DEFAULT_VHS });
+  const [adjustments, setAdjustments] = useState<AdjustmentsSettings>({ ...DEFAULT_ADJUSTMENTS });
+  const [crop, setCrop] = useState<Crop>();
+  const [completedCrop, setCompletedCrop] = useState<PixelCrop | null>(null);
+  const [isCropping, setIsCropping] = useState(false);
+
+  const getPreviewSize = useCallback(() => {
+    let aspect = 1;
+    if (crop && crop.width > 0 && crop.height > 0) {
+      if (isImageMode && image) {
+        aspect = (crop.width * image.width) / (crop.height * image.height);
+      } else if (isVideoMode && videoRef.current) {
+        aspect = (crop.width * videoRef.current.videoWidth) / (crop.height * videoRef.current.videoHeight);
+      }
+    } else if (isImageMode && image) {
+      aspect = image.width / image.height;
+    } else if (isVideoMode && videoRef.current) {
+      aspect = videoRef.current.videoWidth / videoRef.current.videoHeight;
+    }
+
+    let width = MAX_PREVIEW_SIZE;
+    let height = MAX_PREVIEW_SIZE;
+
+    if (aspect > 1) {
+      height = MAX_PREVIEW_SIZE / aspect;
+    } else {
+      width = MAX_PREVIEW_SIZE * aspect;
+    }
+
+    return { width, height, aspect };
+  }, [isImageMode, image, isVideoMode, crop]);
+
   const [asciiAnim, setAsciiAnim] = useState<AsciiAnimSettings>({ ...DEFAULT_ASCII_ANIM });
   const [modelAnim, setModelAnim] = useState<ModelAnimSettings>({ ...DEFAULT_MODEL_ANIM });
   const [image, setImage] = useState<HTMLImageElement | null>(null);
@@ -195,9 +237,9 @@ export function EffectsGenerator() {
     const asciiCanvas = asciiCanvasRef.current;
     if (!asciiCanvas) return;
 
-    const canvasSize = PREVIEW_SIZE;
-    asciiCanvas.width = canvasSize;
-    asciiCanvas.height = canvasSize;
+    const { width: canvasWidth, height: canvasHeight } = getPreviewSize();
+    asciiCanvas.width = canvasWidth;
+    asciiCanvas.height = canvasHeight;
 
     let running = true;
     const loop = () => {
@@ -208,10 +250,12 @@ export function EffectsGenerator() {
 
       const ctx = asciiCanvas.getContext("2d")!;
       ctx.fillStyle = "#0a0a0a";
-      ctx.fillRect(0, 0, canvasSize, canvasSize);
-      ctx.drawImage(modelFrameRef.current, 0, 0, canvasSize, canvasSize);
+      ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+      ctx.filter = `brightness(${adjustments.brightness}%) contrast(${adjustments.contrast}%) hue-rotate(${adjustments.hue}deg) saturate(${adjustments.saturation}%)`;
 
-      const imageData = ctx.getImageData(0, 0, canvasSize, canvasSize);
+      ctx.drawImage(modelFrameRef.current, 0, 0, canvasWidth, canvasHeight);
+
+      const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
 
       if (effectType === "ascii" && modelAnim.enabled) {
         const elapsed = performance.now() - animStartRef.current;
@@ -241,7 +285,7 @@ export function EffectsGenerator() {
       running = false;
       setModelCapturing(false);
     };
-  }, [isModelMode, modelUrl, effectType, applyCurrentEffect, ascii, modelAnim, asciiAnim]);
+  }, [isModelMode, modelUrl, effectType, applyCurrentEffect, ascii, modelAnim, asciiAnim, getPreviewSize, adjustments.brightness, adjustments.contrast, adjustments.hue, adjustments.saturation]);
 
   // Video frame rendering loop
   useEffect(() => {
@@ -250,9 +294,9 @@ export function EffectsGenerator() {
     const video = videoRef.current;
     if (!canvas || !video) return;
 
-    const canvasSize = PREVIEW_SIZE;
-    canvas.width = canvasSize;
-    canvas.height = canvasSize;
+    const { width: canvasWidth, height: canvasHeight } = getPreviewSize();
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
 
     let running = true;
     const loop = () => {
@@ -262,17 +306,33 @@ export function EffectsGenerator() {
       }
 
       const ctx = canvas.getContext("2d")!;
-      const scale = Math.min(canvasSize / video.videoWidth, canvasSize / video.videoHeight);
+
+      // Video aspect ratio
+      const scaleX = canvasWidth / video.videoWidth;
+      const scaleY = canvasHeight / video.videoHeight;
+      const scale = Math.min(scaleX, scaleY);
       const w = video.videoWidth * scale;
       const h = video.videoHeight * scale;
-      const ox = (canvasSize - w) / 2;
-      const oy = (canvasSize - h) / 2;
+      const ox = (canvasWidth - w) / 2;
+      const oy = (canvasHeight - h) / 2;
 
       ctx.fillStyle = "#0a0a0a";
-      ctx.fillRect(0, 0, canvasSize, canvasSize);
-      ctx.drawImage(video, ox, oy, w, h);
+      ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+      ctx.filter = `brightness(${adjustments.brightness}%) contrast(${adjustments.contrast}%) hue-rotate(${adjustments.hue}deg) saturate(${adjustments.saturation}%)`;
 
-      const imageData = ctx.getImageData(0, 0, canvasSize, canvasSize);
+      if (crop && crop.width > 0 && crop.height > 0) {
+        const cropX = (crop.x / 100) * video.videoWidth;
+        const cropY = (crop.y / 100) * video.videoHeight;
+        const cropW = (crop.width / 100) * video.videoWidth;
+        const cropH = (crop.height / 100) * video.videoHeight;
+        ctx.drawImage(video, cropX, cropY, cropW, cropH, ox, oy, w, h);
+    ctx.filter = 'none';
+      } else {
+        ctx.drawImage(video, ox, oy, w, h);
+    ctx.filter = 'none';
+      }
+
+      const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
       applyCurrentEffect(ctx, imageData);
 
       if (running) requestAnimationFrame(loop);
@@ -280,38 +340,53 @@ export function EffectsGenerator() {
 
     requestAnimationFrame(loop);
     return () => { running = false; };
-  }, [isVideoMode, videoUrl, applyCurrentEffect]);
+  }, [isVideoMode, videoUrl, applyCurrentEffect, getPreviewSize, crop, adjustments.brightness, adjustments.contrast, adjustments.hue, adjustments.saturation]);
 
   // Static render for image mode
   useEffect(() => {
     if (!canvasRef.current || !image || isAnimating || isModelMode || isVideoMode) return;
     const canvas = canvasRef.current;
-    const canvasSize = PREVIEW_SIZE * renderScale;
-    canvas.width = canvasSize;
-    canvas.height = canvasSize;
+    const previewSize = getPreviewSize(); const canvasWidth = previewSize.width * renderScale; const canvasHeight = previewSize.height * renderScale;
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
     const ctx = canvas.getContext("2d")!;
 
-    const scale = Math.min(canvasSize / image.width, canvasSize / image.height);
+
+    const scaleX = canvasWidth / image.width;
+    const scaleY = canvasHeight / image.height;
+    const scale = Math.min(scaleX, scaleY);
     const w = image.width * scale;
     const h = image.height * scale;
-    const ox = (canvasSize - w) / 2;
-    const oy = (canvasSize - h) / 2;
+    const ox = (canvasWidth - w) / 2;
+    const oy = (canvasHeight - h) / 2;
 
     ctx.fillStyle = "#0a0a0a";
-    ctx.fillRect(0, 0, canvasSize, canvasSize);
-    ctx.drawImage(image, ox, oy, w, h);
+    ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+    ctx.filter = `brightness(${adjustments.brightness}%) contrast(${adjustments.contrast}%) hue-rotate(${adjustments.hue}deg) saturate(${adjustments.saturation}%)`;
 
-    const imageData = ctx.getImageData(0, 0, canvasSize, canvasSize);
+    if (crop && crop.width > 0 && crop.height > 0) {
+      const cropX = (crop.x / 100) * image.width;
+      const cropY = (crop.y / 100) * image.height;
+      const cropW = (crop.width / 100) * image.width;
+      const cropH = (crop.height / 100) * image.height;
+      ctx.drawImage(image, cropX, cropY, cropW, cropH, ox, oy, w, h);
+    ctx.filter = 'none';
+    } else {
+      ctx.drawImage(image, ox, oy, w, h);
+    ctx.filter = 'none';
+    }
+
+    const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
     applyCurrentEffect(ctx, imageData, renderScale);
-  }, [image, applyCurrentEffect, renderScale, isAnimating, isModelMode, isVideoMode]);
+  }, [image, applyCurrentEffect, renderScale, isAnimating, isModelMode, isVideoMode, getPreviewSize, crop, adjustments.brightness, adjustments.contrast, adjustments.hue, adjustments.saturation]);
 
   // Animation loop for ASCII (image mode)
   useEffect(() => {
     if (!canvasRef.current || !image || !isAnimating || isModelMode) return;
     const canvas = canvasRef.current;
-    const canvasSize = PREVIEW_SIZE * renderScale;
-    canvas.width = canvasSize;
-    canvas.height = canvasSize;
+    const previewSize = getPreviewSize(); const canvasWidth = previewSize.width * renderScale; const canvasHeight = previewSize.height * renderScale;
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
     animStartRef.current = performance.now();
     const cycleDuration = (101 - asciiAnim.speed) * 80;
 
@@ -320,16 +395,31 @@ export function EffectsGenerator() {
       const elapsed = performance.now() - animStartRef.current;
       const progress = (elapsed % cycleDuration) / cycleDuration;
 
-      const scale = Math.min(canvasSize / image.width, canvasSize / image.height);
+
+    const scaleX = canvasWidth / image.width;
+    const scaleY = canvasHeight / image.height;
+    const scale = Math.min(scaleX, scaleY);
       const w = image.width * scale;
       const h = image.height * scale;
-      const ox = (canvasSize - w) / 2;
-      const oy = (canvasSize - h) / 2;
+      const ox = (canvasWidth - w) / 2;
+      const oy = (canvasHeight - h) / 2;
 
       ctx.fillStyle = "#0a0a0a";
-      ctx.fillRect(0, 0, canvasSize, canvasSize);
+    ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+    ctx.filter = `brightness(${adjustments.brightness}%) contrast(${adjustments.contrast}%) hue-rotate(${adjustments.hue}deg) saturate(${adjustments.saturation}%)`;
+
+    if (crop && crop.width > 0 && crop.height > 0) {
+      const cropX = (crop.x / 100) * image.width;
+      const cropY = (crop.y / 100) * image.height;
+      const cropW = (crop.width / 100) * image.width;
+      const cropH = (crop.height / 100) * image.height;
+      ctx.drawImage(image, cropX, cropY, cropW, cropH, ox, oy, w, h);
+    ctx.filter = 'none';
+    } else {
       ctx.drawImage(image, ox, oy, w, h);
-      const imageData = ctx.getImageData(0, 0, canvasSize, canvasSize);
+    ctx.filter = 'none';
+    }
+      const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
 
       renderAsciiAnimated(ctx, imageData, { ...ascii, cellSize: ascii.cellSize * renderScale }, asciiAnim, progress);
       animFrameRef.current = requestAnimationFrame(loop);
@@ -337,7 +427,7 @@ export function EffectsGenerator() {
 
     animFrameRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animFrameRef.current);
-  }, [image, ascii, asciiAnim, renderScale, isAnimating, isModelMode]);
+  }, [image, ascii, asciiAnim, renderScale, isAnimating, isModelMode, getPreviewSize, crop, adjustments.brightness, adjustments.contrast, adjustments.hue, adjustments.saturation]);
 
   const handleFile = (file: File) => {
     const ext = file.name.split(".").pop()?.toLowerCase();
@@ -454,18 +544,42 @@ export function EffectsGenerator() {
       const offscreen = document.createElement("canvas");
       const srcW = isVideoMode ? (source as HTMLVideoElement).videoWidth : (source as HTMLImageElement).width;
       const srcH = isVideoMode ? (source as HTMLVideoElement).videoHeight : (source as HTMLImageElement).height;
-      const scale = Math.min(res.width / srcW, res.height / srcH);
-      offscreen.width = res.width;
-      offscreen.height = res.height;
+
+      let cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
+      if (crop && crop.width > 0 && crop.height > 0) {
+        cropX = (crop.x / 100) * srcW;
+        cropY = (crop.y / 100) * srcH;
+        cropW = (crop.width / 100) * srcW;
+        cropH = (crop.height / 100) * srcH;
+      }
+
+      // Compute the aspect ratio of what we are exporting
+      const aspect = cropW / cropH;
+      // Adjust export canvas size to match the crop aspect ratio, bounded by the selected preset max dimension
+      const maxDim = Math.max(res.width, res.height);
+      let outW = maxDim;
+      let outH = maxDim;
+      if (aspect > 1) {
+        outH = maxDim / aspect;
+      } else {
+        outW = maxDim * aspect;
+      }
+
+      offscreen.width = outW;
+      offscreen.height = outH;
       const offCtx = offscreen.getContext("2d")!;
-      const w = srcW * scale;
-      const h = srcH * scale;
-      const ox = (res.width - w) / 2;
-      const oy = (res.height - h) / 2;
+
       offCtx.fillStyle = "#0a0a0a";
-      offCtx.fillRect(0, 0, res.width, res.height);
-      offCtx.drawImage(source, ox, oy, w, h);
-      const imgData = offCtx.getImageData(0, 0, res.width, res.height);
+      offCtx.fillRect(0, 0, outW, outH);
+      offCtx.filter = `brightness(${adjustments.brightness}%) contrast(${adjustments.contrast}%) hue-rotate(${adjustments.hue}deg) saturate(${adjustments.saturation}%)`;
+
+      if (crop && crop.width > 0 && crop.height > 0) {
+        offCtx.drawImage(source, cropX, cropY, cropW, cropH, 0, 0, outW, outH);
+      } else {
+        offCtx.drawImage(source, 0, 0, outW, outH);
+      }
+      offCtx.filter = 'none';
+      const imgData = offCtx.getImageData(0, 0, outW, outH);
       applyCurrentEffect(offCtx, imgData);
       await downloadCanvas(offscreen, exportFormat, `grainto-${effectType}-${Date.now()}`);
       toast.success("Effect exported!");
@@ -474,26 +588,47 @@ export function EffectsGenerator() {
     } finally {
       setExporting(false);
     }
-  }, [effectType, image, isVideoMode, exportFormat, exportRes, applyCurrentEffect]);
+  }, [effectType, image, isVideoMode, exportFormat, exportRes, applyCurrentEffect, crop, adjustments]);
 
   const handleAnimExport = useCallback(async () => {
     if (!image) return;
     setExporting(true);
     setExportProgress(0);
     try {
-      const res = RESOLUTION_PRESETS[exportRes] || RESOLUTION_PRESETS.HD;
+      const preset = RESOLUTION_PRESETS[exportRes] || RESOLUTION_PRESETS.HD;
+      const srcW = image.width;
+      const srcH = image.height;
+      let cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
+      if (crop && crop.width > 0 && crop.height > 0) {
+        cropX = (crop.x / 100) * srcW;
+        cropY = (crop.y / 100) * srcH;
+        cropW = (crop.width / 100) * srcW;
+        cropH = (crop.height / 100) * srcH;
+      }
+
+      const aspect = cropW / cropH;
+      const maxDim = Math.max(preset.width, preset.height);
+      let outW = maxDim;
+      let outH = maxDim;
+      if (aspect > 1) {
+        outH = maxDim / aspect;
+      } else {
+        outW = maxDim * aspect;
+      }
+
       await exportAnimation(
-        { width: res.width, height: res.height, fps: asciiAnim.fps, duration: asciiAnim.duration, format: asciiAnim.exportFormat },
+        { width: outW, height: outH, fps: asciiAnim.fps, duration: asciiAnim.duration, format: asciiAnim.exportFormat },
         (canvas, ctx, progress) => {
-          const scale = Math.min(res.width / image.width, res.height / image.height);
-          const w = image.width * scale;
-          const h = image.height * scale;
-          const ox = (res.width - w) / 2;
-          const oy = (res.height - h) / 2;
           ctx.fillStyle = "#0a0a0a";
-          ctx.fillRect(0, 0, res.width, res.height);
-          ctx.drawImage(image, ox, oy, w, h);
-          const imageData = ctx.getImageData(0, 0, res.width, res.height);
+          ctx.fillRect(0, 0, outW, outH);
+          ctx.filter = `brightness(${adjustments.brightness}%) contrast(${adjustments.contrast}%) hue-rotate(${adjustments.hue}deg) saturate(${adjustments.saturation}%)`;
+          if (crop && crop.width > 0 && crop.height > 0) {
+            ctx.drawImage(image, cropX, cropY, cropW, cropH, 0, 0, outW, outH);
+          } else {
+            ctx.drawImage(image, 0, 0, outW, outH);
+          }
+          ctx.filter = 'none';
+          const imageData = ctx.getImageData(0, 0, outW, outH);
           renderAsciiAnimated(ctx, imageData, ascii, asciiAnim, progress);
         },
         (pct) => setExportProgress(Math.round(pct))
@@ -506,7 +641,7 @@ export function EffectsGenerator() {
       setExporting(false);
       setExportProgress(0);
     }
-  }, [image, ascii, asciiAnim, exportRes]);
+  }, [image, ascii, asciiAnim, exportRes, crop, adjustments]);
 
   // Export for 3D model animation (all effects)
   const handleModelAnimExport = useCallback(async () => {
@@ -586,7 +721,7 @@ export function EffectsGenerator() {
               </span>
             </button>
           ) : isModelMode && modelUrl ? (
-            <div className="relative" style={{ width: PREVIEW_SIZE, height: PREVIEW_SIZE }}>
+            <div className="relative" style={{ width: getPreviewSize().width, height: getPreviewSize().height }}>
               {/* 3D Model Viewer (hidden, captures frames for effect processing) */}
               <div className="absolute inset-0" style={{ opacity: 0, pointerEvents: "none" }}>
                 <ModelAsciiViewer
@@ -594,18 +729,18 @@ export function EffectsGenerator() {
                   animSettings={modelAnim}
                   onFrameCapture={handleModelFrame}
                   capturing={true}
-                  size={PREVIEW_SIZE}
+                  size={getPreviewSize().width}
                 />
               </div>
               {/* Effect overlay canvas */}
               <canvas
                 ref={asciiCanvasRef}
                 className="rounded-sm border border-border/20 block absolute inset-0"
-                style={{ width: PREVIEW_SIZE, height: PREVIEW_SIZE }}
+                style={{ width: getPreviewSize().width, height: getPreviewSize().height }}
               />
             </div>
           ) : isVideoMode && videoUrl ? (
-            <div className="relative" style={{ width: PREVIEW_SIZE, height: PREVIEW_SIZE }}>
+            <div className="relative" style={{ width: getPreviewSize().width, height: getPreviewSize().height }}>
               <video
                 ref={videoRef}
                 src={videoUrl}
@@ -619,16 +754,27 @@ export function EffectsGenerator() {
                   const video = videoRef.current;
                   const canvas = canvasRef.current;
                   if (!video || !canvas) return;
-                  canvas.width = PREVIEW_SIZE;
-                  canvas.height = PREVIEW_SIZE;
+                  canvas.width = getPreviewSize().width;
+                  canvas.height = getPreviewSize().height;
                   const ctx = canvas.getContext("2d")!;
-                  const scale = Math.min(PREVIEW_SIZE / video.videoWidth, PREVIEW_SIZE / video.videoHeight);
+                  const scale = Math.min(getPreviewSize().width / video.videoWidth, getPreviewSize().height / video.videoHeight);
                   const w = video.videoWidth * scale;
                   const h = video.videoHeight * scale;
                   ctx.fillStyle = "#0a0a0a";
-                  ctx.fillRect(0, 0, PREVIEW_SIZE, PREVIEW_SIZE);
-                  ctx.drawImage(video, (PREVIEW_SIZE - w) / 2, (PREVIEW_SIZE - h) / 2, w, h);
-                  const imageData = ctx.getImageData(0, 0, PREVIEW_SIZE, PREVIEW_SIZE);
+                  ctx.fillRect(0, 0, getPreviewSize().width, getPreviewSize().height);
+                  ctx.filter = `brightness(${adjustments.brightness}%) contrast(${adjustments.contrast}%) hue-rotate(${adjustments.hue}deg) saturate(${adjustments.saturation}%)`;
+                  if (crop && crop.width > 0 && crop.height > 0) {
+                    const cropX = (crop.x / 100) * video.videoWidth;
+                    const cropY = (crop.y / 100) * video.videoHeight;
+                    const cropW = (crop.width / 100) * video.videoWidth;
+                    const cropH = (crop.height / 100) * video.videoHeight;
+                    ctx.drawImage(video, cropX, cropY, cropW, cropH, (getPreviewSize().width - w) / 2, (getPreviewSize().height - h) / 2, w, h);
+                  ctx.filter = 'none';
+                  } else {
+                    ctx.drawImage(video, (getPreviewSize().width - w) / 2, (getPreviewSize().height - h) / 2, w, h);
+                  ctx.filter = 'none';
+                  }
+                  const imageData = ctx.getImageData(0, 0, getPreviewSize().width, getPreviewSize().height);
                   applyCurrentEffect(ctx, imageData);
                 }}
                 onEnded={() => setIsPlaying(false)}
@@ -636,7 +782,7 @@ export function EffectsGenerator() {
               <canvas
                 ref={canvasRef}
                 className="rounded-sm border border-border/20 block"
-                style={{ width: PREVIEW_SIZE, height: PREVIEW_SIZE }}
+                style={{ width: getPreviewSize().width, height: getPreviewSize().height }}
               />
               {/* Play/Pause overlay */}
               <button
@@ -651,13 +797,25 @@ export function EffectsGenerator() {
               ref={canvasRef}
               className="rounded-sm border border-border/20"
               style={{
-                width: PREVIEW_SIZE,
-                height: PREVIEW_SIZE,
+                width: getPreviewSize().width,
+                height: getPreviewSize().height,
                 transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom / renderScale})`,
                 transition: isDragging ? "none" : "transform 0.1s ease-out",
               }}
             />
           )}
+          <div className="absolute top-4 right-4 z-10 flex gap-2">
+            {(isImageMode || isVideoMode) && (image || videoUrl) && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setIsCropping(!isCropping)}
+                className="bg-background/80 backdrop-blur-md border-border/40 hover:bg-background"
+              >
+                {isCropping ? "Finish Crop" : "Crop Source"}
+              </Button>
+            )}
+          </div>
           <input
             ref={fileInputRef}
             type="file"
@@ -687,7 +845,19 @@ export function EffectsGenerator() {
       {/* Settings Panel */}
       <div className="w-[280px] border-l border-border/40 flex flex-col shrink-0">
         <div className="flex-1 overflow-y-auto custom-scrollbar">
-          {/* Effect Type */}
+
+          {/* Global Image Adjustments */}
+          {(isImageMode || isVideoMode) && (
+            <SettingsSection title="Image Adjustments" defaultOpen={false}>
+              <InlineSlider label="Brightness" value={adjustments.brightness} min={0} max={200} onChange={(v) => setAdjustments(a => ({ ...a, brightness: v }))} onReset={() => setAdjustments(a => ({ ...a, brightness: 100 }))} />
+              <InlineSlider label="Contrast" value={adjustments.contrast} min={0} max={200} onChange={(v) => setAdjustments(a => ({ ...a, contrast: v }))} onReset={() => setAdjustments(a => ({ ...a, contrast: 100 }))} />
+              <InlineSlider label="Saturation" value={adjustments.saturation} min={0} max={200} onChange={(v) => setAdjustments(a => ({ ...a, saturation: v }))} onReset={() => setAdjustments(a => ({ ...a, saturation: 100 }))} />
+              <InlineSlider label="Hue" value={adjustments.hue} min={-180} max={180} onChange={(v) => setAdjustments(a => ({ ...a, hue: v }))} onReset={() => setAdjustments(a => ({ ...a, hue: 0 }))} />
+            </SettingsSection>
+          )}
+
+          {/* Settings depending on the type */}
+{/* Effect Type */}
           <SettingsSection title="Settings" defaultOpen>
             <SettingsRow label="Effect">
               <Select value={effectType} onValueChange={(v) => setEffectType(v as EffectType)}>
